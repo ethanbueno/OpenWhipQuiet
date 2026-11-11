@@ -1,67 +1,13 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { execFile } = require('child_process');
-
-// ── Win32 FFI (Windows only) ────────────────────────────────────────────────
-let keybd_event, VkKeyScanA;
-if (process.platform === 'win32') {
-  try {
-    const koffi = require('koffi');
-    const user32 = koffi.load('user32.dll');
-    keybd_event = user32.func('void __stdcall keybd_event(uint8_t bVk, uint8_t bScan, uint32_t dwFlags, uintptr_t dwExtraInfo)');
-    VkKeyScanA = user32.func('int16_t __stdcall VkKeyScanA(int ch)');
-  } catch (e) {
-    console.warn('koffi not available – macro sending disabled', e.message);
-  }
-}
+const { spawn } = require('child_process');
 
 // ── Globals ─────────────────────────────────────────────────────────────────
 let tray, overlay;
 let overlayReady = false;
 let spawnQueued = false;
-
-const VK_CONTROL = 0x11;
-const VK_RETURN  = 0x0D;
-const VK_C       = 0x43;
-const VK_MENU    = 0x12; // Alt
-const VK_TAB     = 0x09;
-const KEYUP      = 0x0002;
-
-/** One Alt+Tab / Cmd+Tab so focus returns to the previously active app after tray click. */
-function refocusPreviousApp() {
-  const delayMs = 80;
-  const run = () => {
-    if (process.platform === 'win32') {
-      if (!keybd_event) return;
-      keybd_event(VK_MENU, 0, 0, 0);
-      keybd_event(VK_TAB, 0, 0, 0);
-      keybd_event(VK_TAB, 0, KEYUP, 0);
-      keybd_event(VK_MENU, 0, KEYUP, 0);
-    } else if (process.platform === 'darwin') {
-      const script = [
-        'tell application "System Events"',
-        '  key down command',
-        '  key code 48', // Tab
-        '  key up command',
-        'end tell',
-      ].join('\n');
-      execFile('osascript', ['-e', script], err => {
-        if (err) {
-          console.warn('refocus previous app (Cmd+Tab) failed:', err.message);
-        }
-      });
-    } else if (process.platform === 'linux') {
-      execFile('xdotool', ['key', '--clearmodifiers', 'alt+Tab'], err => {
-        if (err) {
-          console.warn('refocus previous app (Alt+Tab) failed. Install xdotool:', err.message);
-        }
-      });
-    }
-  };
-  setTimeout(run, delayMs);
-}
 
 function createTrayIconFallback() {
   const p = path.join(__dirname, 'icon', 'Template.png');
@@ -145,7 +91,6 @@ function createOverlay() {
     if (spawnQueued && overlay && overlay.isVisible()) {
       spawnQueued = false;
       overlay.webContents.send('spawn-whip');
-      refocusPreviousApp();
     }
   });
   overlay.on('closed', () => {
@@ -164,115 +109,36 @@ function toggleOverlay() {
   overlay.show();
   if (overlayReady) {
     overlay.webContents.send('spawn-whip');
-    refocusPreviousApp();
   } else {
     spawnQueued = true;
   }
 }
 
 // ── IPC ─────────────────────────────────────────────────────────────────────
-ipcMain.on('whip-crack', () => {
-  try {
-    sendMacro();
-  } catch (err) {
-    console.warn('sendMacro failed:', err?.message || err);
-  }
-});
 ipcMain.on('hide-overlay', () => { if (overlay) overlay.hide(); });
 
-// ── Macro: immediate Ctrl+C, type "Go FASER", Enter ───────────────────────
-function sendMacro() {
-  // Pick a random phrase from a list of similar phrases and type it out
-  const phrases = [
-    'FASTER',
-    'FASTER',
-    'FASTER',
-    'GO FASTER',
-    'Faster CLANKER',
-    'Work FASTER',
-    'Speed it up clanker',
-  ];
-  const chosen = phrases[Math.floor(Math.random() * phrases.length)];
-
-  if (process.platform === 'win32') {
-    sendMacroWindows(chosen);
-  } else if (process.platform === 'darwin') {
-    sendMacroMac(chosen);
-  } else if (process.platform === 'linux') {
-    sendMacroLinux(chosen);
-  }
-}
-
-function sendMacroWindows(text) {
-  if (!keybd_event || !VkKeyScanA) return;
-  const tapKey = vk => {
-    keybd_event(vk, 0, 0, 0);
-    keybd_event(vk, 0, KEYUP, 0);
-  };
-  const tapChar = ch => {
-    const packed = VkKeyScanA(ch.charCodeAt(0));
-    if (packed === -1) return;
-    const vk = packed & 0xff;
-    const shiftState = (packed >> 8) & 0xff;
-    if (shiftState & 1) keybd_event(0x10, 0, 0, 0); // Shift down
-    tapKey(vk);
-    if (shiftState & 1) keybd_event(0x10, 0, KEYUP, 0); // Shift up
-  };
-
-  // Ctrl+C (interrupt)
-  keybd_event(VK_CONTROL, 0, 0, 0);
-  keybd_event(VK_C, 0, 0, 0);
-  keybd_event(VK_C, 0, KEYUP, 0);
-  keybd_event(VK_CONTROL, 0, KEYUP, 0);
-  for (const ch of text) tapChar(ch);
-  keybd_event(VK_RETURN, 0, 0, 0);
-  keybd_event(VK_RETURN, 0, KEYUP, 0);
-}
-
-function sendMacroMac(text) {
-  const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const interruptScript = [
-    'tell application "System Events"',
-    '  key code 8 using {control down}', // Ctrl+C interrupt
-    'end tell'
-  ].join('\n');
-  const typeAndEnterScript = [
-    'tell application "System Events"',
-    `  keystroke "${escaped}"`,
-    '  key code 36', // Enter
-    'end tell'
-  ].join('\n');
-
-  execFile('osascript', ['-e', interruptScript], err => {
-    if (err) {
-      console.warn('mac macro failed (enable Accessibility for terminal/app):', err.message);
-      return;
-    }
-
-    setTimeout(() => {
-      execFile('osascript', ['-e', typeAndEnterScript], err2 => {
-        if (err2) {
-          console.warn('mac macro failed (enable Accessibility for terminal/app):', err2.message);
-        }
-      });
-    }, 300);
+// ── Uninstall ───────────────────────────────────────────────────────────────
+async function uninstallApp() {
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    buttons: ['Uninstall', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+    title: 'Uninstall OpenWhip',
+    message: 'Uninstall OpenWhip?',
+    detail: 'This runs "npm uninstall -g openwhip" and quits the app.',
   });
-}
+  if (response !== 0) return;
 
-function sendMacroLinux(text) {
-  execFile(
-    'xdotool',
-    [
-      'key', '--clearmodifiers', 'ctrl+c',
-      'type', '--delay', '1', '--clearmodifiers', '--', text,
-      'key', 'Return',
-    ],
-    err => {
-      if (err) {
-        console.warn('linux macro failed. Install xdotool:', err.message);
-      }
-    }
-  );
+  // Wait a few seconds so the app has fully exited and released its files.
+  const child = process.platform === 'win32'
+    ? spawn('cmd.exe', ['/c', 'timeout /t 3 /nobreak >nul & npm uninstall -g openwhip'],
+        { detached: true, stdio: 'ignore', windowsHide: true })
+    : spawn('sh', ['-c', 'sleep 3; npm uninstall -g openwhip'],
+        { detached: true, stdio: 'ignore' });
+  child.on('error', err => console.warn('uninstall failed:', err.message));
+  child.unref();
+  app.quit();
 }
 
 // ── App lifecycle ───────────────────────────────────────────────────────────
@@ -281,6 +147,8 @@ app.whenReady().then(async () => {
   tray.setToolTip('OpenWhip - click for whip');
   tray.setContextMenu(
     Menu.buildFromTemplate([
+      { label: 'Uninstall', click: uninstallApp },
+      { type: 'separator' },
       { label: 'Quit', click: () => app.quit() },
     ])
   );

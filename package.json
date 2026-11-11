@@ -46,7 +46,6 @@
     "pack": "npm pack"
   },
   "dependencies": {
-    "electron": "^33.0.0",
-    "koffi": "^2.9.0"
+    "electron": "^33.0.0"
   }
 }
