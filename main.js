@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -138,6 +138,7 @@ async function uninstallApp() {
         { detached: true, stdio: 'ignore' });
   child.on('error', err => console.warn('uninstall failed:', err.message));
   child.unref();
+  shell.openExternal('https://github.com/ethanbueno/OpenWhipQuiet').catch(() => {});
   app.quit();
 }
 
@@ -147,9 +148,9 @@ app.whenReady().then(async () => {
   tray.setToolTip('OpenWhip - click for whip');
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: 'Uninstall', click: uninstallApp },
-      { type: 'separator' },
       { label: 'Quit', click: () => app.quit() },
+      { type: 'separator' },
+      { label: 'Uninstall', click: uninstallApp },
     ])
   );
   tray.on('click', toggleOverlay);
