@@ -34,6 +34,7 @@
     "main.js",
     "preload.js",
     "overlay.html",
+    "OpenWhip.vbs",
     "sounds",
     "icon",
     "bin/openwhip.js",
@@ -43,9 +44,45 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "pack": "npm pack"
+    "pack": "npm pack",
+    "dist": "electron-builder --win"
   },
   "dependencies": {
-    "electron": "^33.0.0"
+    "koffi": "^2.16.3"
+  },
+  "build": {
+    "appId": "com.ethanbueno.openwhip",
+    "productName": "OpenWhip",
+    "files": [
+      "main.js",
+      "preload.js",
+      "overlay.html",
+      "sounds/**",
+      "icon/**",
+      "!node_modules/koffi/build/koffi/!(win32_x64)/**"
+    ],
+    "electronLanguages": [
+      "en-US"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "icon/Template.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "OpenWhip",
+      "runAfterFinish": true
+    }
+  },
+  "allowScripts": {
+    "electron@33.4.11": true,
+    "koffi@2.16.3": true
+  },
+  "devDependencies": {
+    "electron": "^45.3.0",
+    "electron-builder": "^26.18.0"
   }
 }

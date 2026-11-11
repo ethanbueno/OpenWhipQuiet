@@ -22,7 +22,7 @@ sudo apt install xdotool
 - Click tray icon: spawn whip.
 - Click: drop whip.
 - Whip him 😩💢
-- It sends an interrupt (Ctrl-C) and one of 5 encouraging messages!
+- It sends an interrupt (Ctrl-C) and one of 5 encouraging messages! (REMOVED)
 
 ## Roadmap
 

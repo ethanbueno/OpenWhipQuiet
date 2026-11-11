@@ -48,10 +48,20 @@ const P = {
   wallBounce:      0.42,   // velocity retained after wall hit
   wallFriction:    0.86,   // tangential damping on wall hit
 
-  // Crack detection
-  crackSpeed:     340,     // tip velocity threshold to trigger crack
-  crackCooldownMs:200,   // min ms between cracks
-  firstCrackGraceMs: 350, // no crack (macro) until this long after spawn
+  // Crack detection. A real whip cracks when the tip snaps: it whips out fast, then
+  // stops or reverses suddenly. Speeds are the tip's own motion, minus the handle's,
+  // so dragging the whole whip around doesn't crack it.
+  crackSpeed:      150,   // tip speed (px/frame) a swing must reach before it can crack
+  crackSnapDrop:   0.6,   // crack fires when tip speed falls below this fraction of the swing's peak
+  crackRearmRatio: 0.5,   // tip must slow below crackSpeed * this before the next swing can crack
+  crackCooldownMs: 120,   // min ms between cracks
+  firstCrackGraceMs: 350, // no crack until this long after spawn
+  crackFullSpeed:  320,   // swing peak speed that gives a full-volume crack
+
+  // Swish: a quiet whoosh while the whip moves through the air
+  swishVolume:     0.18,  // 0 turns it off
+  swishMinSpeed:   40,    // tip speed where the whoosh starts
+  swishMaxSpeed:   300,   // tip speed where the whoosh is loudest
 
   // Visuals
   lineWidthHandle: 7,      // rope thickness near handle
@@ -82,6 +92,8 @@ let whip = null;
 let dropping = false;
 let lastCrackTime = 0;
 let whipSpawnTime = 0;
+let crackArmed = false;
+let swingPeak = 0;
 let handleAngle = P.baseTargetAngle;
 let handleAngVel = 0;
 
@@ -97,6 +109,8 @@ function spawnWhip(mx, my) {
   dropping = false;
   lastCrackTime = 0;
   whipSpawnTime = Date.now();
+  crackArmed = false;
+  swingPeak = 0;
   const pts = [];
   for (let i = 0; i < P.segments; i++) {
     const t = i / (P.segments - 1);
@@ -160,11 +174,82 @@ const wrapPi = a => {
   return a;
 };
 
-function playCrackSound() {
+/** `intensity` 0..1: harder swings crack louder and a touch higher. */
+function playCrackSound(intensity) {
   if (!WHIP_CRACK_SOUNDS.length) return;
   const src = WHIP_CRACK_SOUNDS[Math.floor(Math.random() * WHIP_CRACK_SOUNDS.length)];
   const a = new Audio(src);
+  a.volume = lerp(0.35, 1, intensity);
+  a.preservesPitch = false;
+  a.playbackRate = lerp(0.94, 1.06, intensity) * lerp(0.97, 1.03, Math.random());
   a.play().catch(() => {});
+}
+
+// ── Swish (synthesised: filtered noise whose loudness follows tip speed) ────
+let swish = null;
+
+function startSwish() {
+  if (swish || !P.swishVolume) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  try {
+    const ac = new AC();
+    const buf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const src = ac.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const filter = ac.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.value = 0.9;
+    filter.frequency.value = 500;
+    const gain = ac.createGain();
+    gain.gain.value = 0;
+    src.connect(filter).connect(gain).connect(ac.destination);
+    src.start();
+    swish = { ac, filter, gain };
+  } catch (e) {
+    swish = null;
+  }
+}
+
+function setSwish(speed) {
+  if (!swish) return;
+  const t = clamp((speed - P.swishMinSpeed) / (P.swishMaxSpeed - P.swishMinSpeed), 0, 1);
+  const now = swish.ac.currentTime;
+  swish.gain.gain.setTargetAtTime(P.swishVolume * t * t, now, 0.03);
+  swish.filter.frequency.setTargetAtTime(lerp(400, 2600, t), now, 0.03);
+}
+
+/**
+ * Fires the crack at the snap: once a swing has got fast enough, the crack plays on
+ * the frame the tip's speed falls away from its peak.
+ */
+function detectCrack(speed) {
+  const now = Date.now();
+  if (dropping || now - whipSpawnTime < P.firstCrackGraceMs) {
+    crackArmed = false;
+    swingPeak = 0;
+    return;
+  }
+  swingPeak = Math.max(swingPeak, speed);
+  if (
+    crackArmed &&
+    swingPeak >= P.crackSpeed &&
+    speed < swingPeak * P.crackSnapDrop &&
+    now - lastCrackTime > P.crackCooldownMs
+  ) {
+    crackArmed = false;
+    lastCrackTime = now;
+    const t = (swingPeak - P.crackSpeed) / (P.crackFullSpeed - P.crackSpeed);
+    playCrackSound(clamp(t, 0, 1));
+  }
+  // Once the tip has slowed right down, the next swing can crack.
+  if (speed < P.crackSpeed * P.crackRearmRatio) {
+    crackArmed = true;
+    swingPeak = 0;
+  }
 }
 
 function updateHandleAim() {
@@ -353,18 +438,13 @@ function update() {
     applyWallCollisions();
   }
 
-  // Tip velocity for crack detection
+  // Tip speed relative to the handle, for the crack and the swish.
   const tip = whip[whip.length - 1];
-  const tipVel = Math.hypot(tip.x - tip.px, tip.y - tip.py);
-
-  if (!dropping && tipVel > P.crackSpeed) {
-    const now = Date.now();
-    if (now - whipSpawnTime >= P.firstCrackGraceMs && now - lastCrackTime > P.crackCooldownMs) {
-      lastCrackTime = now;
-      playCrackSound();
-      window.bridge.whipCrack();
-    }
-  }
+  const handleVx = dropping ? 0 : mouseX - prevMouseX;
+  const handleVy = dropping ? 0 : mouseY - prevMouseY;
+  const tipSpeed = Math.hypot(tip.x - tip.px - handleVx, tip.y - tip.py - handleVy);
+  detectCrack(tipSpeed);
+  setSwish(dropping ? 0 : tipSpeed);
 
   // If dropping, check if everything fell off screen
   if (dropping && whip.every(p => p.y > H + 60)) {
@@ -443,6 +523,8 @@ window.bridge.onSpawnWhip(() => {
   prevMouseY = mouseY;
   handleAngle = P.baseTargetAngle;
   handleAngVel = 0;
+  startSwish();
+  if (swish && swish.ac.state === 'suspended') swish.ac.resume().catch(() => {});
 });
 
 window.bridge.onDropWhip(() => {
