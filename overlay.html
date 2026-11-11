@@ -15,25 +15,32 @@
 //  PHYSICS SETTINGS — TWEAK EVERYTHING HERE
 // ══════════════════════════════════════════════════════════════════════════════
 const P = {
+  // Time. The whip runs on its own clock, so it moves the same on a 60 Hz screen as on
+  // a 144 Hz one. One tick is 1/60 s; settings described as "per tick" use that unit.
+  substeps:       4,      // physics steps per tick (more = smoother, stiffer fast swings)
+  timeScale:      1,      // overall speed of the whip (1 = normal, 2 = twice as fast)
+  maxFrameMs:     50,     // after a stall, simulate at most this much time in one frame
+
   // Rope structure
   segments:       28,     // number of chain links
   segmentLength:  25,     // base length of each link (px)
   taper:          0.6,   // tip segment is this fraction of base length
+  tipMass:        0.15,   // weight of the tip compared with the handle end (1 = same weight all along)
 
   // Physics
-  gravity:        1.2,   // normal gravity
+  gravity:        1.2,   // normal gravity (px per tick, per tick)
   dropGravity:    0.95,    // gravity when dropping/despawning
-  damping:        0.96,  // velocity retention per frame (1 = no loss)
-  constraintIters:20,     // higher = stiffer chain
+  airDragAlong:   0.99,  // speed kept per tick sliding along the whip's own length (1 = no loss)
+  airDragAcross:  0.96,  // speed kept per tick moving sideways through the air
+  constraintIters: 5,     // solver passes per substep; higher = stiffer chain
   maxStretchRatio: 1.2,  // hard cap for per-link stretch during fast whips
 
-  // Dynamic handle aim (target angle + restoring spring, not static lock)
+  // Dynamic handle aim (the handle tilts toward where the mouse is moving)
   baseTargetAngle: -1.12, // radians, default "up-right" resting direction
-  handleAimByMouseX: 0.4, // horizontal mouse movement influence on target angle
-  handleAimByMouseY: 0.2, // vertical mouse movement influence on target angle
+  handleAimByMouseX: 0.4, // horizontal mouse movement (px per tick) influence on target angle
+  handleAimByMouseY: 0.2, // vertical mouse movement (px per tick) influence on target angle
   handleAimClamp:    2.0,  // max radians target can deviate from base angle
-  handleSpring:      0.7,  // restoring force to target angle
-  handleAngularDamping: 0.078, // angular velocity damping
+  handleTurnRate:    0.06, // fraction of the way the handle turns toward its target each tick
   basePoseSegments: 2,    // how many early segments are strongly guided
   basePoseStiffStart: 0.9, // stiffness near handle
   basePoseStiffEnd:   0.8, // stiffness near end of guided region
@@ -51,7 +58,7 @@ const P = {
   // Crack detection. A real whip cracks when the tip snaps: it whips out fast, then
   // stops or reverses suddenly. Speeds are the tip's own motion, minus the handle's,
   // so dragging the whole whip around doesn't crack it.
-  crackSpeed:      150,   // tip speed (px/frame) a swing must reach before it can crack
+  crackSpeed:      150,   // tip speed (px per tick) a swing must reach before it can crack
   crackSnapDrop:   0.6,   // crack fires when tip speed falls below this fraction of the swing's peak
   crackRearmRatio: 0.5,   // tip must slow below crackSpeed * this before the next swing can crack
   crackCooldownMs: 120,   // min ms between cracks
@@ -78,6 +85,8 @@ const P = {
 
 // ══════════════════════════════════════════════════════════════════════════════
 
+const TICK_HZ = 60; // ticks per second of simulated time
+
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 let W, H;
@@ -87,15 +96,27 @@ resize();
 window.addEventListener('resize', resize);
 
 let mouseX = 0, mouseY = 0;
-let prevMouseX = 0, prevMouseY = 0;
 let whip = null;
 let dropping = false;
-let lastCrackTime = 0;
-let whipSpawnTime = 0;
+let handleAngle = P.baseTargetAngle;
+
+// Simulation clock
+let simTime = 0;                        // simulated seconds since the whip spawned
+let accumulator = 0;                    // simulated time owed but not yet stepped
+let renderAlpha = 1;                    // where the drawn frame sits between the last two steps
+let lastFrameMs = null;                 // timestamp of the previous animation frame
+let handleX = 0, handleY = 0;           // handle position at the last physics step
+let frameMouseX = 0, frameMouseY = 0;   // mouse position at the previous animation frame
+
+// Per-point data, rebuilt on spawn
+let invMass = [];                       // 1 / weight of each point
+let dirX = [], dirY = [];               // direction of the whip at each point
+let drawPts = [];                       // interpolated points for drawing
+
+// Crack detection
+let lastCrackTime = -Infinity;
 let crackArmed = false;
 let swingPeak = 0;
-let handleAngle = P.baseTargetAngle;
-let handleAngVel = 0;
 
 const WHIP_CRACK_SOUNDS = ['sounds/A.mp3', 'sounds/B.mp3', 'sounds/C.mp3', 'sounds/D.mp3', 'sounds/E.mp3'];
 
@@ -104,20 +125,35 @@ document.addEventListener('mousedown', () => {
   if (whip && !dropping) dropping = true;
 });
 
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+
 // ── Whip creation ───────────────────────────────────────────────────────────
 function spawnWhip(mx, my) {
   dropping = false;
-  lastCrackTime = 0;
-  whipSpawnTime = Date.now();
+  simTime = 0;
+  accumulator = 0;
+  renderAlpha = 1;
+  lastFrameMs = null;
+  lastCrackTime = -Infinity;
   crackArmed = false;
   swingPeak = 0;
   const pts = [];
+  invMass = [];
+  dirX = [];
+  dirY = [];
+  drawPts = [];
   for (let i = 0; i < P.segments; i++) {
     const t = i / (P.segments - 1);
     // Nice upward arc from handle (mouse) to tip
     const x = mx + t * P.arcWidth;
     const y = my - Math.sin(t * Math.PI * 0.75) * P.arcHeight;
-    pts.push({ x, y, px: x, py: y });
+    pts.push({ x, y, px: x, py: y, ox: x, oy: y });
+    // A whip tapers: each point is lighter than the one before it.
+    invMass.push(1 / lerp(1, P.tipMass, t));
+    dirX.push(1);
+    dirY.push(0);
+    drawPts.push({ x, y });
   }
   return pts;
 }
@@ -126,9 +162,6 @@ function segLen(i) {
   const t = i / (P.segments - 1);
   return P.segmentLength * (1 - t * (1 - P.taper));
 }
-
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-const lerp = (a, b, t) => a + (b - a) * t;
 
 /** Point on Catmull–Rom spline (extrapolated ends) for index i in `pts`. */
 function catmullPoint(pts, i) {
@@ -224,11 +257,11 @@ function setSwish(speed) {
 
 /**
  * Fires the crack at the snap: once a swing has got fast enough, the crack plays on
- * the frame the tip's speed falls away from its peak.
+ * the step the tip's speed falls away from its peak. `speed` is in px per tick.
  */
 function detectCrack(speed) {
-  const now = Date.now();
-  if (dropping || now - whipSpawnTime < P.firstCrackGraceMs) {
+  const now = simTime * 1000;
+  if (dropping || now < P.firstCrackGraceMs) {
     crackArmed = false;
     swingPeak = 0;
     return;
@@ -252,10 +285,9 @@ function detectCrack(speed) {
   }
 }
 
-function updateHandleAim() {
+/** Turns the handle toward where the mouse is heading. `mvx`, `mvy` are px per tick. */
+function updateHandleAim(mvx, mvy, S) {
   if (dropping) return;
-  const mvx = mouseX - prevMouseX;
-  const mvy = mouseY - prevMouseY;
   const delta = clamp(
     mvx * P.handleAimByMouseX + mvy * P.handleAimByMouseY,
     -P.handleAimClamp,
@@ -263,9 +295,7 @@ function updateHandleAim() {
   );
   const target = P.baseTargetAngle + delta;
   const err = wrapPi(target - handleAngle);
-  handleAngVel += err * P.handleSpring;
-  handleAngVel *= P.handleAngularDamping;
-  handleAngle = wrapPi(handleAngle + handleAngVel);
+  handleAngle = wrapPi(handleAngle + err * (1 - Math.pow(1 - P.handleTurnRate, 1 / S)));
 }
 
 function applyBasePose() {
@@ -380,30 +410,74 @@ function applyWallCollisions() {
 }
 
 // ── Physics step ────────────────────────────────────────────────────────────
-function update() {
-  if (!whip) return;
 
-  const g = dropping ? P.dropGravity : P.gravity;
-  updateHandleAim();
-
-  // Verlet integration
+/** Applies air drag and gravity, then moves every free point (Verlet). */
+function integrate(S) {
+  const n = whip.length;
+  const g = (dropping ? P.dropGravity : P.gravity) / (S * S);
+  const along = Math.pow(P.airDragAlong, 1 / S);
+  const across = Math.pow(P.airDragAcross, 1 / S);
   const start = dropping ? 0 : 1; // if dropping, handle is free too
-  for (let i = start; i < whip.length; i++) {
+
+  // Direction the whip runs at each point, measured before anything moves.
+  for (let i = 0; i < n; i++) {
+    const a = whip[Math.max(i - 1, 0)], b = whip[Math.min(i + 1, n - 1)];
+    const tx = b.x - a.x, ty = b.y - a.y;
+    const len = Math.hypot(tx, ty) || 1;
+    dirX[i] = tx / len;
+    dirY[i] = ty / len;
+  }
+
+  // A rope slips easily through the air along its own length but is slowed moving
+  // sideways, which is what lets a loop roll down a whip instead of just collapsing.
+  for (let i = start; i < n; i++) {
     const p = whip[i];
-    const vx = (p.x - p.px) * P.damping;
-    const vy = (p.y - p.py) * P.damping;
+    const vx = p.x - p.px, vy = p.y - p.py;
+    const vAlong = vx * dirX[i] + vy * dirY[i];
+    const ax = vAlong * dirX[i], ay = vAlong * dirY[i];
     p.px = p.x;
     p.py = p.y;
-    p.x += vx;
-    p.y += vy + g;
+    p.x += ax * along + (vx - ax) * across;
+    p.y += ay * along + (vy - ay) * across + g;
   }
+}
+
+/** Pulls each link back to its length. The lighter end of a link moves more. */
+function solveLinks() {
+  for (let i = 0; i < whip.length - 1; i++) {
+    const a = whip[i], b = whip[i + 1];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+    const wa = i === 0 && !dropping ? 0 : invMass[i]; // a held handle doesn't give
+    const wb = invMass[i + 1];
+    const k = (dist - segLen(i)) / dist / (wa + wb);
+    a.x += dx * k * wa; a.y += dy * k * wa;
+    b.x -= dx * k * wb; b.y -= dy * k * wb;
+  }
+}
+
+/** One physics step, with the handle held at (hx, hy). `S` is steps per tick. */
+function substep(hx, hy, S) {
+  const n = whip.length;
+  const tip = whip[n - 1];
+  const hdx = dropping ? 0 : hx - handleX;
+  const hdy = dropping ? 0 : hy - handleY;
+  handleX = hx;
+  handleY = hy;
+  updateHandleAim(hdx * S, hdy * S, S);
+
+  for (let i = 0; i < n; i++) {
+    whip[i].ox = whip[i].x;
+    whip[i].oy = whip[i].y;
+  }
+  integrate(S);
 
   // Pin handle to mouse
   if (!dropping) {
-    whip[0].x = mouseX;
-    whip[0].y = mouseY;
-    whip[0].px = mouseX;
-    whip[0].py = mouseY;
+    whip[0].x = hx;
+    whip[0].y = hy;
+    whip[0].px = hx;
+    whip[0].py = hy;
   }
 
   // Prevent rubber-band stretching spikes before constraints.
@@ -413,24 +487,8 @@ function update() {
   // Keep early whip segments posed upward from handle.
   applyBasePose();
 
-  // Distance constraints (multiple iterations for stiffness)
   for (let iter = 0; iter < P.constraintIters; iter++) {
-    for (let i = 0; i < whip.length - 1; i++) {
-      const a = whip[i], b = whip[i + 1];
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
-      const target = segLen(i);
-      const diff = (dist - target) / dist * 0.5;
-      const ox = dx * diff, oy = dy * diff;
-      if (i === 0 && !dropping) {
-        // Handle is pinned – push only the next point
-        b.x -= ox * 2;
-        b.y -= oy * 2;
-      } else {
-        a.x += ox; a.y += oy;
-        b.x -= ox; b.y -= oy;
-      }
-    }
+    solveLinks();
     // Clamp bend angle per joint; near handle = stiffer, near tip = floppier.
     applyBendLimits();
     if (!dropping) applyBasePose();
@@ -438,13 +496,11 @@ function update() {
     applyWallCollisions();
   }
 
-  // Tip speed relative to the handle, for the crack and the swish.
-  const tip = whip[whip.length - 1];
-  const handleVx = dropping ? 0 : mouseX - prevMouseX;
-  const handleVy = dropping ? 0 : mouseY - prevMouseY;
-  const tipSpeed = Math.hypot(tip.x - tip.px - handleVx, tip.y - tip.py - handleVy);
+  // Tip speed relative to the handle (px per tick), for the crack and the swish.
+  const tipSpeed = Math.hypot(tip.x - tip.px - hdx, tip.y - tip.py - hdy) * S;
   detectCrack(tipSpeed);
   setSwish(dropping ? 0 : tipSpeed);
+  simTime += 1 / (TICK_HZ * S);
 
   // If dropping, check if everything fell off screen
   if (dropping && whip.every(p => p.y > H + 60)) {
@@ -452,8 +508,31 @@ function update() {
     dropping = false;
     window.bridge.hideOverlay();
   }
-  prevMouseX = mouseX;
-  prevMouseY = mouseY;
+}
+
+/**
+ * Advances the simulation by `elapsed` seconds of real time, in fixed steps. The handle
+ * follows a straight line from where the mouse was last frame to where it is now, so a
+ * fast flick is fed to the whip smoothly instead of as one jump per frame.
+ */
+function advance(elapsed) {
+  if (!whip) return;
+  const S = Math.max(1, Math.round(P.substeps));
+  const dt = 1 / (TICK_HZ * S);
+  const span = elapsed * P.timeScale;
+  const fromX = frameMouseX, fromY = frameMouseY;
+  frameMouseX = mouseX;
+  frameMouseY = mouseY;
+  const owed = accumulator;
+  accumulator += span;
+  let k = 0;
+  while (whip && accumulator >= dt) {
+    accumulator -= dt;
+    k++;
+    const u = span > 0 ? clamp((k * dt - owed) / span, 0, 1) : 1;
+    substep(lerp(fromX, mouseX, u), lerp(fromY, mouseY, u), S);
+  }
+  renderAlpha = clamp(accumulator / dt, 0, 1);
 }
 
 // ── Rendering ───────────────────────────────────────────────────────────────
@@ -466,26 +545,34 @@ function draw() {
 
   if (!whip) return;
 
+  // Draw the whip part-way between its last two physics steps, so it moves smoothly
+  // whatever the screen's refresh rate.
+  const pts = drawPts;
+  for (let i = 0; i < whip.length; i++) {
+    pts[i].x = lerp(whip[i].ox, whip[i].x, renderAlpha);
+    pts[i].y = lerp(whip[i].oy, whip[i].y, renderAlpha);
+  }
+
   // White: thin halo on full spline, then extra thickness only over handle links.
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.strokeStyle = '#fff';
-  if (whip.length >= 2) {
+  if (pts.length >= 2) {
     ctx.beginPath();
-    ctx.moveTo(whip[0].x, whip[0].y);
-    for (let i = 0; i < whip.length - 1; i++) {
-      const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 0; i < pts.length - 1; i++) {
+      const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(pts, i);
       ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
     }
     ctx.lineWidth = P.lineWidthTip + P.outlineWidth * 2;
     ctx.stroke();
 
-    const thickLinks = Math.min(P.handleThickSegments, whip.length - 1);
+    const thickLinks = Math.min(P.handleThickSegments, pts.length - 1);
     if (thickLinks > 0 && P.handleExtraWidth > 0) {
       ctx.beginPath();
-      ctx.moveTo(whip[0].x, whip[0].y);
+      ctx.moveTo(pts[0].x, pts[0].y);
       for (let i = 0; i < thickLinks; i++) {
-        const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
+        const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(pts, i);
         ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
       }
       ctx.lineWidth =
@@ -495,34 +582,39 @@ function draw() {
   }
 
   ctx.strokeStyle = '#111';
-  for (let i = 0; i < whip.length - 1; i++) {
-    const t = i / Math.max(1, whip.length - 2);
+  for (let i = 0; i < pts.length - 1; i++) {
+    const t = i / Math.max(1, pts.length - 2);
     const extra = i < P.handleThickSegments ? P.handleExtraWidth : 0;
     ctx.lineWidth = lerp(P.lineWidthHandle, P.lineWidthTip, t) + extra;
-    const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
+    const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(pts, i);
     ctx.beginPath();
-    ctx.moveTo(whip[i].x, whip[i].y);
+    ctx.moveTo(pts[i].x, pts[i].y);
     ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
     ctx.stroke();
   }
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
-function loop() {
-  update();
+function frame(nowMs) {
+  if (whip) {
+    const elapsedMs = lastFrameMs === null ? 0 : Math.min(nowMs - lastFrameMs, P.maxFrameMs);
+    lastFrameMs = nowMs;
+    advance(Math.max(elapsedMs, 0) / 1000);
+  } else {
+    lastFrameMs = null;
+  }
   draw();
-  requestAnimationFrame(loop);
+  requestAnimationFrame(frame);
 }
-loop();
+requestAnimationFrame(frame);
 
 // ── IPC from main process ───────────────────────────────────────────────────
 window.bridge.onSpawnWhip(() => {
   whip = spawnWhip(mouseX || W / 2, mouseY || H / 2);
   dropping = false;
-  prevMouseX = mouseX;
-  prevMouseY = mouseY;
+  handleX = frameMouseX = mouseX;
+  handleY = frameMouseY = mouseY;
   handleAngle = P.baseTargetAngle;
-  handleAngVel = 0;
   startSwish();
   if (swish && swish.ac.state === 'suspended') swish.ac.resume().catch(() => {});
 });
